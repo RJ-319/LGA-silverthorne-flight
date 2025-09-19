@@ -1,5 +1,5 @@
-import os, json, requests
-from datetime import date, timedelta, datetime, time
+import os, json, time, requests
+from datetime import date, timedelta, datetime, time as dtime
 from dateutil.relativedelta import relativedelta
 import pytz
 from statistics import median
@@ -16,42 +16,68 @@ CURRENCY = "USD"
 NONSTOP_ONLY = True
 
 # Airline preferences / filters
-PREFERRED_AIRLINES = ["DL"]               # try these first
-SECONDARY_AIRLINES = ["AA", "UA", "B6"]   # then try these
-BLOCKED_AIRLINES = []                     # e.g., ["F9","NK"] to exclude ULCCs
+# Prefer legacy carriers first; then fallback to "any except blocked"
+PREFERRED_AIRLINES = ["DL"]            # try these first
+SECONDARY_AIRLINES = ["AA", "UA", "B6"]  # then these
+BLOCKED_AIRLINES = []                  # e.g., ["F9","NK"] to exclude ULCCs
 
 # Time windows (local airport times)
 NY_TZ = pytz.timezone("America/New_York")
 DEN_TZ = pytz.timezone("America/Denver")
-OUTBOUND_EARLIEST_ET = time(18, 0)            # Thu after 6:00 PM ET
-RETURN_WINDOW_START_MT = time(12, 0)          # Sun 12:00 PM MT
-RETURN_WINDOW_END_MT   = time(15, 30)         # Sun 3:30 PM MT
+OUTBOUND_EARLIEST_ET = dtime(18, 0)         # Thu after 6:00 PM ET
+RETURN_WINDOW_START_MT = dtime(12, 0)       # Sun ≥12:00 PM MT
+RETURN_WINDOW_END_MT   = dtime(15, 30)      # Sun ≤3:30 PM MT
 
 # Near-term scan (~2 months)
 NEAR_TERM_WEEKS = 9
 
-# Rare-deal scan (~12 months) and trigger
-RARE_LOOKAHEAD_MONTHS = 12
+# Rare-deal scan (~6 months for speed; bump to 12 later if desired)
+RARE_LOOKAHEAD_MONTHS = 6
 RARE_MIN_DROP = 0.35          # include if >=35% below baseline (relative, not absolute)
 RARE_MAX_RESULTS = 3
+
+# HTTP timeouts (seconds)
+POST_TIMEOUT = 20
+GET_TIMEOUT = 20
 # ------------------------------------------
 
+# --- token cache / refresh ---
+_TOKEN = None
+_TOKEN_EXP = 0  # epoch seconds
 
-def get_token():
+def _fetch_token():
     r = requests.post(
         f"{BASE_URL}/v1/security/oauth2/token",
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         data={"grant_type": "client_credentials",
               "client_id": CLIENT_ID,
               "client_secret": CLIENT_SECRET},
-        timeout=30,
+        timeout=POST_TIMEOUT,
     )
     if r.status_code != 200:
         raise RuntimeError(f"Amadeus token error {r.status_code}: {r.text}")
-    return r.json()["access_token"]
+    data = r.json()
+    tok = data["access_token"]
+    ttl = int(data.get("expires_in", 1800)) - 120  # refresh 2m early
+    exp = int(time.time()) + max(300, ttl)
+    return tok, exp
 
+def get_token():
+    global _TOKEN, _TOKEN_EXP
+    _TOKEN, _TOKEN_EXP = _fetch_token()
+    return _TOKEN
 
-def amadeus_search(token, dep_date, ret_date, include_codes=None, exclude_codes=None):
+def ensure_token():
+    now = int(time.time())
+    if not _TOKEN or now >= _TOKEN_EXP:
+        return get_token()
+    return _TOKEN
+
+# --------------- helpers -------------------
+
+def amadeus_search(token_unused, dep_date, ret_date, include_codes=None, exclude_codes=None):
+    """Call /v2/shopping/flight-offers with auto token refresh + one retry on 401."""
+    tok = ensure_token()
     params = {
         "originLocationCode": ORIGIN,
         "destinationLocationCode": DEST,
@@ -66,26 +92,32 @@ def amadeus_search(token, dep_date, ret_date, include_codes=None, exclude_codes=
     if include_codes:
         params["includedAirlineCodes"] = ",".join(include_codes)
 
-    r = requests.get(
-        f"{BASE_URL}/v2/shopping/flight-offers",
-        headers={"Authorization": f"Bearer {token}"},
-        params=params,
-        timeout=60,
-    )
+    def call(tk):
+        return requests.get(
+            f"{BASE_URL}/v2/shopping/flight-offers",
+            headers={"Authorization": f"Bearer {tk}"},
+            params=params,
+            timeout=GET_TIMEOUT,
+        )
+
+    r = call(tok)
+    if r.status_code == 401:
+        tok = get_token()
+        r = call(tok)
+
     r.raise_for_status()
     data = r.json().get("data", [])
 
     if exclude_codes:
+        excl = set(exclude_codes)
         def first_carrier(off):
             return off["itineraries"][0]["segments"][0]["carrierCode"]
-        data = [o for o in data if first_carrier(o) not in set(exclude_codes)]
+        data = [o for o in data if first_carrier(o) not in excl]
 
     return data
 
-
-def parse_amadeus_dt(s):
+def parse_iso_dt(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
-
 
 def is_nonstop_offer(offer):
     for itin in offer["itineraries"]:
@@ -93,12 +125,11 @@ def is_nonstop_offer(offer):
             return False
     return True
 
-
 def times_ok(offer):
     out_seg = offer["itineraries"][0]["segments"][0]
     ret_seg = offer["itineraries"][1]["segments"][0]
-    out_dep = parse_amadeus_dt(out_seg["departure"]["at"])
-    ret_dep = parse_amadeus_dt(ret_seg["departure"]["at"])
+    out_dep = parse_iso_dt(out_seg["departure"]["at"])
+    ret_dep = parse_iso_dt(ret_seg["departure"]["at"])
     out_dep_local = NY_TZ.normalize(out_dep.astimezone(NY_TZ)) if out_dep.tzinfo else NY_TZ.localize(out_dep)
     ret_dep_local = DEN_TZ.normalize(ret_dep.astimezone(DEN_TZ)) if ret_dep.tzinfo else DEN_TZ.localize(ret_dep)
     if out_dep_local.time() < OUTBOUND_EARLIEST_ET:
@@ -107,14 +138,11 @@ def times_ok(offer):
         return False
     return True
 
-
 def total_price_for_two(offer):
     return float(offer["price"]["grandTotal"])
 
-
 def airline_code(offer):
     return offer["itineraries"][0]["segments"][0]["carrierCode"]
-
 
 def cabin_from_offer(offer):
     try:
@@ -122,7 +150,6 @@ def cabin_from_offer(offer):
         return fd.get("cabin", "UNKNOWN")
     except Exception:
         return "UNKNOWN"
-
 
 def generate_thu_sun_pairs(n_weeks, start_from=None):
     today = start_from or date.today()
@@ -133,9 +160,7 @@ def generate_thu_sun_pairs(n_weeks, start_from=None):
         sun = thu + timedelta(days=3)
         yield thu, sun
 
-
 def generate_thu_sun_pairs_months(months):
-    # From next Thu until months ahead
     today = date.today()
     end_date = today + relativedelta(months=+months)
     days_to_thu = (3 - today.weekday()) % 7
@@ -144,20 +169,22 @@ def generate_thu_sun_pairs_months(months):
         yield cur_thu, cur_thu + timedelta(days=3)
         cur_thu += timedelta(weeks=1)
 
-
 def find_offers(token, thu, sun):
     dep, ret = str(thu), str(sun)
 
-    # 1) Preferred
-    offers = amadeus_search(token, dep, ret, include_codes=PREFERRED_AIRLINES, exclude_codes=BLOCKED_AIRLINES)
-    # 2) Secondary
-    if not offers and SECONDARY_AIRLINES:
-        offers = amadeus_search(token, dep, ret, include_codes=SECONDARY_AIRLINES, exclude_codes=BLOCKED_AIRLINES)
-    # 3) Any
-    if not offers:
-        offers = amadeus_search(token, dep, ret, include_codes=None, exclude_codes=BLOCKED_AIRLINES)
+    # One pass with preferred + secondary first
+    first_pass = list(dict.fromkeys(PREFERRED_AIRLINES + SECONDARY_AIRLINES))
+    offers = amadeus_search(token, dep, ret,
+                            include_codes=first_pass,
+                            exclude_codes=BLOCKED_AIRLINES)
 
-    # Filter
+    # Fallback: any airline except blocked
+    if not offers:
+        offers = amadeus_search(token, dep, ret,
+                                include_codes=None,
+                                exclude_codes=BLOCKED_AIRLINES)
+
+    # Filter by nonstop + time windows
     filt = []
     for off in offers:
         if NONSTOP_ONLY and not is_nonstop_offer(off):
@@ -166,7 +193,6 @@ def find_offers(token, thu, sun):
             continue
         filt.append(off)
     return filt
-
 
 def extract_winners_by_cabin(filtered_offers):
     winners = {}
@@ -192,25 +218,21 @@ def extract_winners_by_cabin(filtered_offers):
                     "to": ret_seg["arrival"]["iataCode"],
                 },
             }
-    def get_price(c):
-        return winners.get(c, {}).get("price_total_2")
+    def p(c): return winners.get(c, {}).get("price_total_2")
     return {
         "ECONOMY": winners.get("ECONOMY"),
         "PREMIUM_ECONOMY": winners.get("PREMIUM_ECONOMY"),
         "FIRST": winners.get("FIRST"),
-        "min_price": min([p for p in [get_price("ECONOMY"), get_price("PREMIUM_ECONOMY"), get_price("FIRST")] if p is not None], default=None),
+        "min_price": min([x for x in [p("ECONOMY"), p("PREMIUM_ECONOMY"), p("FIRST")] if x is not None], default=None),
     }
-
 
 def cheapest_by_cabin(token, thu, sun):
     filtered = find_offers(token, thu, sun)
     return extract_winners_by_cabin(filtered)
 
-
 def build_rare_deals(token):
-    """Scan ~12 months; build baseline (median of all economy prices),
-       and emit entries ≥ RARE_MIN_DROP below baseline."""
-    records = []  # list of {"weekend":(thu,sun), "econ_price":float, "winner":dict}
+    """Scan months ahead; build median baseline of ECONOMY prices; emit relative outliers."""
+    records = []  # {"weekend":(thu,sun), "econ_price":float, "winner":dict}
     for thu, sun in generate_thu_sun_pairs_months(RARE_LOOKAHEAD_MONTHS):
         winners = cheapest_by_cabin(token, thu, sun)
         econ = winners.get("ECONOMY")
@@ -222,15 +244,15 @@ def build_rare_deals(token):
             })
 
     if len(records) < 6:
-        return []  # not enough data to form a baseline
+        return []
 
-    baseline = median(r["econ_price"] for r in records)
-    if baseline <= 0:
+    base = median(r["econ_price"] for r in records)
+    if base <= 0:
         return []
 
     outliers = []
     for r in records:
-        drop = (baseline - r["econ_price"]) / baseline  # relative
+        drop = (base - r["econ_price"]) / base
         if drop >= RARE_MIN_DROP:
             thu, sun = r["weekend"]
             w = r["winner"]
@@ -244,19 +266,20 @@ def build_rare_deals(token):
                 "return": w["return"],
             })
 
-    # Sort: biggest drop first, then cheapest absolute price
     outliers.sort(key=lambda x: (-x["pct_below_baseline"], x["price_total_2"]))
     return outliers[:RARE_MAX_RESULTS]
 
+# ------------------- main -------------------
 
 def main():
-    token = get_token()
+    # prime token
+    get_token()
 
-    # --- Near-term scan for daily_pick ---
+    # Near-term daily pick (~2 months)
     weekends = list(generate_thu_sun_pairs(NEAR_TERM_WEEKS))
     near_results = []
     for thu, sun in weekends:
-        winners = cheapest_by_cabin(token, thu, sun)
+        winners = cheapest_by_cabin(_TOKEN, thu, sun)
         near_results.append({
             "weekend": {"thu": str(thu), "sun": str(sun)},
             "winners": winners,
@@ -264,8 +287,8 @@ def main():
     candidates = [r for r in near_results if r["winners"]["min_price"] is not None]
     best = min(candidates, key=lambda r: r["winners"]["min_price"]) if candidates else None
 
-    # --- Year-ahead outliers ---
-    rare = build_rare_deals(token)
+    # Year-ahead rare deals (relative)
+    rare = build_rare_deals(_TOKEN)
 
     output = {
         "route": f"{ORIGIN}-{DEST}",
@@ -282,7 +305,6 @@ def main():
         json.dump(output, f, indent=2)
 
     print(f"Saved docs/latest_fares.json | daily_pick: {'yes' if best else 'no'} | rare_deals: {len(rare)}")
-
 
 if __name__ == "__main__":
     main()
