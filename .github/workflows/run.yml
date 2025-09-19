@@ -2,35 +2,32 @@ name: flight-watch
 
 on:
   schedule:
-    # Runs daily at 09:00 ET (13:00 UTC); adjust if you want
+    # Runs daily at 09:00 ET (13:00 UTC). Change if you prefer.
     - cron: "0 13 * * *"
-  workflow_dispatch: {}  # allows manual runs from the Actions tab
+  workflow_dispatch: {}   # allow manual runs from the Actions tab
 
 permissions:
-  contents: write  # needed to commit the JSON back to the repo
+  contents: write         # needed to push docs/latest_fares.json
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      # 1) Checkout with full history
+      # Checkout full history so we can rebase/push cleanly
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # 2) Set up Python
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # Install dependencies
       - name: Install deps
         run: |
           pip install requests python-dateutil pytz
 
-      # Run fare fetcher
       - name: Run fare fetcher
         env:
           AMADEUS_CLIENT_ID: ${{ secrets.AMADEUS_CLIENT_ID }}
@@ -38,22 +35,21 @@ jobs:
         run: |
           python get_fares.py
 
-      # Prepare docs folder for GitHub Pages
       - name: Prepare docs folder for GitHub Pages
         run: |
           mkdir -p docs
           mv -f latest_fares.json docs/latest_fares.json || true
 
-      # 2) Sync with remote before committing
-      - name: Sync with remote
+      # Sync with remote safely (autostash handles the local JSON change)
+      - name: Sync with remote (autostash)
         run: |
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git config --global user.name "github-actions[bot]"
           git fetch origin main
           git checkout main
-          git pull --rebase
+          git add -A
+          git pull --rebase --autostash
 
-      # 3) Commit JSON to repo with force-with-lease
       - name: Commit JSON to repo
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
