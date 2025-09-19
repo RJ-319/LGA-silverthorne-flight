@@ -1,0 +1,43 @@
+name: flight-watch
+
+on:
+  schedule:
+    # Runs daily at 09:00 ET (13:00 UTC); adjust if you want
+    - cron: "0 13 * * *"
+  workflow_dispatch: {}   # allows manual runs from the Actions tab
+
+permissions:
+  contents: write   # needed to commit the JSON back to the repo
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Run fare fetcher
+        env:
+          AMADEUS_CLIENT_ID: ${{ secrets.AMADEUS_CLIENT_ID }}
+          AMADEUS_CLIENT_SECRET: ${{ secrets.AMADEUS_CLIENT_SECRET }}
+        run: |
+          python get_fares.py
+
+      - name: Prepare docs folder for GitHub Pages
+        run: |
+          mkdir -p docs
+          mv -f latest_fares.json docs/latest_fares.json || true
+
+      - name: Commit JSON to repo
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Update latest_fares.json"
+          file_pattern: docs/latest_fares.json
