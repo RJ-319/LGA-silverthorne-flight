@@ -1,4 +1,203 @@
 {
-  "status": "placeholder",
-  "message": "This will be replaced by real flight data after the workflow runs."
+  "route": "LGA-DEN",
+  "pax": 2,
+  "currency": "USD",
+  "generated_at_utc": "2025-09-19T20:04:01.820134Z",
+  "near_term_scan": [
+    {
+      "weekend": {
+        "thu": "2025-09-25",
+        "sun": "2025-09-28"
+      },
+      "winners": {
+        "ECONOMY": {
+          "price_total_2": 1255.98,
+          "airline": "UA",
+          "outbound": {
+            "dep": "2025-09-25T18:50:00",
+            "arr": "2025-09-25T21:11:00",
+            "from": "LGA",
+            "to": "DEN"
+          },
+          "return": {
+            "dep": "2025-09-28T14:00:00",
+            "arr": "2025-09-28T19:48:00",
+            "from": "DEN",
+            "to": "LGA"
+          }
+        },
+        "PREMIUM_ECONOMY": null,
+        "FIRST": null,
+        "min_price": 1255.98
+      }
+    },
+    {
+      "weekend": {
+        "thu": "2025-10-02",
+        "sun": "2025-10-05"
+      },
+      "winners": {
+        "ECONOMY": {
+          "price_total_2": 1105.84,
+          "airline": "UA",
+          "outbound": {
+            "dep": "2025-10-02T18:50:00",
+            "arr": "2025-10-02T21:11:00",
+            "from": "LGA",
+            "to": "DEN"
+          },
+          "return": {
+            "dep": "2025-10-05T14:00:00",
+            "arr": "2025-10-05T19:48:00",
+            "from": "DEN",
+            "to": "LGA"
+          }
+        },
+        "PREMIUM_ECONOMY": null,
+        "FIRST": null,
+        "min_price": 1105.84
+      }
+    },
+    {
+      "weekend": {
+        "thu": "2025-10-09",
+        "sun": "2025-10-12"
+      },
+      "winners": {
+        "ECONOMY": null,
+        "PREMIUM_ECONOMY": null,
+        "FIRST": null,
+        "min_price": null
+      }
+    },
+    {
+      "weekend": {
+        "thu": "2025-10-16",
+        "sun": "2025-10-19"
+      },
+      "winners": {
+        "ECONOMY": null,
+        "PREMIUM_ECONOMY": null,
+        "FIRST": null,
+        "min_price": null
+      }
+    },
+    {
+      "weekend": {
+        "thu": "2025-10-23",
+        "sun": "2025-10-26"
+      },
+      "winners": {
+        "ECONOMY": null,
+        "PREMIUM_ECONOMY": null,
+        "FIRST": null,
+        "min_price": null
+      }
+    },
+    {
+      "weekend": {
+        "thu": "2025-10-30",
+        "sun": "2025-11-02"
+      },
+      "winners": {
+        "ECONOMY": null,
+        "PREMIUM_ECONOMY": null,
+        "FIRST": null,
+        "min_price": null
+      }
+    },
+    {
+      "weekend": {
+        "thu": "2025-11-06",
+        "sun": "2025-11-09"
+      },
+      "winners": {
+        "ECONOMY": {
+          "price_total_2": 795.88,
+          "airline": "F9",
+          "outbound": {
+            "dep": "2025-11-06T20:36:00",
+            "arr": "2025-11-06T22:59:00",
+            "from": "LGA",
+            "to": "DEN"
+          },
+          "return": {
+            "dep": "2025-11-09T13:37:00",
+            "arr": "2025-11-09T19:29:00",
+            "from": "DEN",
+            "to": "LGA"
+          }
+        },
+        "PREMIUM_ECONOMY": null,
+        "FIRST": null,
+        "min_price": 795.88
+      }
+    },
+    {
+      "weekend": {
+        "thu": "2025-11-13",
+        "sun": "2025-11-16"
+      },
+      "winners": {
+        "ECONOMY": {
+          "price_total_2": 795.88,
+          "airline": "F9",
+          "outbound": {
+            "dep": "2025-11-13T20:36:00",
+            "arr": "2025-11-13T22:59:00",
+            "from": "LGA",
+            "to": "DEN"
+          },
+          "return": {
+            "dep": "2025-11-16T13:37:00",
+            "arr": "2025-11-16T19:29:00",
+            "from": "DEN",
+            "to": "LGA"
+          }
+        },
+        "PREMIUM_ECONOMY": null,
+        "FIRST": null,
+        "min_price": 795.88
+      }
+    },
+    {
+      "weekend": {
+        "thu": "2025-11-20",
+        "sun": "2025-11-23"
+      },
+      "winners": {
+        "ECONOMY": null,
+        "PREMIUM_ECONOMY": null,
+        "FIRST": null,
+        "min_price": null
+      }
+    }
+  ],
+  "daily_pick": {
+    "weekend": {
+      "thu": "2025-11-06",
+      "sun": "2025-11-09"
+    },
+    "winners": {
+      "ECONOMY": {
+        "price_total_2": 795.88,
+        "airline": "F9",
+        "outbound": {
+          "dep": "2025-11-06T20:36:00",
+          "arr": "2025-11-06T22:59:00",
+          "from": "LGA",
+          "to": "DEN"
+        },
+        "return": {
+          "dep": "2025-11-09T13:37:00",
+          "arr": "2025-11-09T19:29:00",
+          "from": "DEN",
+          "to": "LGA"
+        }
+      },
+      "PREMIUM_ECONOMY": null,
+      "FIRST": null,
+      "min_price": 795.88
+    }
+  }
 }
