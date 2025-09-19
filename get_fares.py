@@ -30,6 +30,7 @@ NEAR_TERM_WEEKS = 9  # ~2 months
 def get_token():
     r = requests.post(
         f"{BASE_URL}/v1/security/oauth2/token",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
         data={
             "grant_type": "client_credentials",
             "client_id": CLIENT_ID,
@@ -37,7 +38,9 @@ def get_token():
         },
         timeout=30,
     )
-    r.raise_for_status()
+    if r.status_code != 200:
+        # Print server message to the Actions log (no secrets here)
+        raise RuntimeError(f"Amadeus token error {r.status_code}: {r.text}")
     return r.json()["access_token"]
 
 
