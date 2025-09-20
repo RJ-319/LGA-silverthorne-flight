@@ -1,8 +1,12 @@
-import os, json, time, requests
+import os, json, time
 from datetime import date, timedelta, datetime, time as dtime
-from dateutil.relativedelta import relativedelta
-import pytz
 from statistics import median
+
+import pytz
+import requests
+from dateutil.relativedelta import relativedelta
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ----------------- CONFIG -----------------
 BASE_URL = "https://test.api.amadeus.com"
@@ -16,10 +20,9 @@ CURRENCY = "USD"
 NONSTOP_ONLY = True
 
 # Airline preferences / filters
-# Prefer legacy carriers first; then fallback to "any except blocked"
-PREFERRED_AIRLINES = ["DL"]            # try these first
-SECONDARY_AIRLINES = ["AA", "UA", "B6"]  # then these
-BLOCKED_AIRLINES = []                  # e.g., ["F9","NK"] to exclude ULCCs
+PREFERRED_AIRLINES = ["DL"]           # try first
+SECONDARY_AIRLINES = ["AA", "UA", "B6"]
+BLOCKED_AIRLINES = []                 # e.g. ["F9","NK"]
 
 # Time windows (local airport times)
 NY_TZ = pytz.timezone("America/New_York")
@@ -31,34 +34,58 @@ RETURN_WINDOW_END_MT   = dtime(15, 30)      # Sun ≤3:30 PM MT
 # Near-term scan (~2 months)
 NEAR_TERM_WEEKS = 9
 
-# Rare-deal scan (~6 months for speed; bump to 12 later if desired)
+# Rare-deal scan (~6 months; bump to 12 later if desired)
 RARE_LOOKAHEAD_MONTHS = 6
-RARE_MIN_DROP = 0.35          # include if >=35% below baseline (relative, not absolute)
+RARE_MIN_DROP = 0.35           # include if >=35% below baseline
 RARE_MAX_RESULTS = 3
 
-# HTTP timeouts (seconds)
+# HTTP timeouts & retries
 POST_TIMEOUT = 20
-GET_TIMEOUT = 20
+GET_TIMEOUT  = 20
+RETRY_TOTAL = 3
+RETRY_BACKOFF = 1.0
+RETRY_STATUSES = (429, 500, 502, 503, 504)
 # ------------------------------------------
 
-# --- token cache / refresh ---
+# --------- robust requests session ---------
+def build_session():
+    retry = Retry(
+        total=RETRY_TOTAL,
+        connect=RETRY_TOTAL,
+        read=RETRY_TOTAL,
+        backoff_factor=RETRY_BACKOFF,
+        status_forcelist=RETRY_STATUSES,
+        allowed_methods={"GET", "POST"},
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    s = requests.Session()
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+S = build_session()
+
+# -------- token cache / refresh ------------
 _TOKEN = None
 _TOKEN_EXP = 0  # epoch seconds
 
 def _fetch_token():
-    r = requests.post(
+    r = S.post(
         f"{BASE_URL}/v1/security/oauth2/token",
         headers={"Content-Type": "application/x-www-form-urlencoded"},
-        data={"grant_type": "client_credentials",
-              "client_id": CLIENT_ID,
-              "client_secret": CLIENT_SECRET},
+        data={
+            "grant_type": "client_credentials",
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+        },
         timeout=POST_TIMEOUT,
     )
     if r.status_code != 200:
         raise RuntimeError(f"Amadeus token error {r.status_code}: {r.text}")
     data = r.json()
     tok = data["access_token"]
-    ttl = int(data.get("expires_in", 1800)) - 120  # refresh 2m early
+    ttl = int(data.get("expires_in", 1800)) - 120  # refresh a bit early
     exp = int(time.time()) + max(300, ttl)
     return tok, exp
 
@@ -74,48 +101,6 @@ def ensure_token():
     return _TOKEN
 
 # --------------- helpers -------------------
-
-def amadeus_search(token_unused, dep_date, ret_date, include_codes=None, exclude_codes=None):
-    """Call /v2/shopping/flight-offers with auto token refresh + one retry on 401."""
-    tok = ensure_token()
-    params = {
-        "originLocationCode": ORIGIN,
-        "destinationLocationCode": DEST,
-        "departureDate": dep_date,
-        "returnDate": ret_date,
-        "adults": ADULTS,
-        "currencyCode": CURRENCY,
-        "max": 50,
-    }
-    if NONSTOP_ONLY:
-        params["nonStop"] = "true"
-    if include_codes:
-        params["includedAirlineCodes"] = ",".join(include_codes)
-
-    def call(tk):
-        return requests.get(
-            f"{BASE_URL}/v2/shopping/flight-offers",
-            headers={"Authorization": f"Bearer {tk}"},
-            params=params,
-            timeout=GET_TIMEOUT,
-        )
-
-    r = call(tok)
-    if r.status_code == 401:
-        tok = get_token()
-        r = call(tok)
-
-    r.raise_for_status()
-    data = r.json().get("data", [])
-
-    if exclude_codes:
-        excl = set(exclude_codes)
-        def first_carrier(off):
-            return off["itineraries"][0]["segments"][0]["carrierCode"]
-        data = [o for o in data if first_carrier(o) not in excl]
-
-    return data
-
 def parse_iso_dt(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
@@ -150,6 +135,56 @@ def cabin_from_offer(offer):
         return fd.get("cabin", "UNKNOWN")
     except Exception:
         return "UNKNOWN"
+
+def amadeus_search(token_unused, dep_date, ret_date, include_codes=None, exclude_codes=None):
+    """
+    Call /v2/shopping/flight-offers with:
+    - token auto-refresh
+    - one retry on 401
+    - session-level retries/backoff for transient errors
+    Returns [] on non-fatal RequestException (so the scan keeps going).
+    """
+    tok = ensure_token()
+    params = {
+        "originLocationCode": ORIGIN,
+        "destinationLocationCode": DEST,
+        "departureDate": dep_date,
+        "returnDate": ret_date,
+        "adults": ADULTS,
+        "currencyCode": CURRENCY,
+        "max": 50,
+    }
+    if NONSTOP_ONLY:
+        params["nonStop"] = "true"
+    if include_codes:
+        params["includedAirlineCodes"] = ",".join(include_codes)
+
+    def call(tk):
+        return S.get(
+            f"{BASE_URL}/v2/shopping/flight-offers",
+            headers={"Authorization": f"Bearer {tk}"},
+            params=params,
+            timeout=GET_TIMEOUT,
+        )
+
+    try:
+        r = call(tok)
+        if r.status_code == 401:
+            tok = get_token()
+            r = call(tok)
+        r.raise_for_status()
+        data = r.json().get("data", [])
+    except requests.RequestException as e:
+        print(f"[warn] flight-offers request failed for {dep_date}->{ret_date}: {e}")
+        return []
+
+    if exclude_codes:
+        excl = set(exclude_codes)
+        def first_carrier(off):
+            return off["itineraries"][0]["segments"][0]["carrierCode"]
+        data = [o for o in data if first_carrier(o) not in excl]
+
+    return data
 
 def generate_thu_sun_pairs(n_weeks, start_from=None):
     today = start_from or date.today()
@@ -231,10 +266,15 @@ def cheapest_by_cabin(token, thu, sun):
     return extract_winners_by_cabin(filtered)
 
 def build_rare_deals(token):
-    """Scan months ahead; build median baseline of ECONOMY prices; emit relative outliers."""
+    """Scan months ahead; build median baseline of ECONOMY prices; emit relative outliers.
+       Resilient: if a weekend query fails, it’s skipped (scan continues)."""
     records = []  # {"weekend":(thu,sun), "econ_price":float, "winner":dict}
     for thu, sun in generate_thu_sun_pairs_months(RARE_LOOKAHEAD_MONTHS):
-        winners = cheapest_by_cabin(token, thu, sun)
+        try:
+            winners = cheapest_by_cabin(token, thu, sun)
+        except Exception as e:
+            print(f"[warn] weekend {thu}->{sun} failed: {e}")
+            continue
         econ = winners.get("ECONOMY")
         if econ and winners["min_price"] is not None:
             records.append({
@@ -270,20 +310,24 @@ def build_rare_deals(token):
     return outliers[:RARE_MAX_RESULTS]
 
 # ------------------- main -------------------
-
 def main():
-    # prime token
+    # prime token (also validates secrets early)
     get_token()
 
     # Near-term daily pick (~2 months)
     weekends = list(generate_thu_sun_pairs(NEAR_TERM_WEEKS))
     near_results = []
     for thu, sun in weekends:
-        winners = cheapest_by_cabin(_TOKEN, thu, sun)
+        try:
+            winners = cheapest_by_cabin(_TOKEN, thu, sun)
+        except Exception as e:
+            print(f"[warn] near-term weekend {thu}->{sun} failed: {e}")
+            winners = {"ECONOMY": None, "PREMIUM_ECONOMY": None, "FIRST": None, "min_price": None}
         near_results.append({
             "weekend": {"thu": str(thu), "sun": str(sun)},
             "winners": winners,
         })
+
     candidates = [r for r in near_results if r["winners"]["min_price"] is not None]
     best = min(candidates, key=lambda r: r["winners"]["min_price"]) if candidates else None
 
