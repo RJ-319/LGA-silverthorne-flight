@@ -13,16 +13,18 @@ BASE_URL = "https://test.api.amadeus.com"
 CLIENT_ID = os.environ["AMADEUS_CLIENT_ID"]
 CLIENT_SECRET = os.environ["AMADEUS_CLIENT_SECRET"]
 
-ORIGIN = "LGA"
-DEST = "DEN"
+NYC_OUTBOUND_AIRPORTS = ["LGA", "JFK"]   # try either for Thu departure
+NYC_RETURN_AIRPORTS   = ["LGA", "JFK"]   # allow return to either on Sun
+DEN = "DEN"
+
 ADULTS = 2
 CURRENCY = "USD"
 NONSTOP_ONLY = True
 
 # Airline preferences / filters
-PREFERRED_AIRLINES = ["DL"]           # try first
+PREFERRED_AIRLINES = ["DL"]            # try first
 SECONDARY_AIRLINES = ["AA", "UA", "B6"]
-BLOCKED_AIRLINES = []                 # e.g. ["F9","NK"]
+BLOCKED_AIRLINES = []                  # e.g., ["F9","NK"]
 
 # Time windows (local airport times)
 NY_TZ = pytz.timezone("America/New_York")
@@ -34,7 +36,7 @@ RETURN_WINDOW_END_MT   = dtime(15, 30)      # Sun ≤3:30 PM MT
 # Near-term scan (~2 months)
 NEAR_TERM_WEEKS = 9
 
-# Rare-deal scan (~6 months; bump to 12 later if desired)
+# Rare-deal scan (~6 months; bump to 12 if desired)
 RARE_LOOKAHEAD_MONTHS = 6
 RARE_MIN_DROP = 0.35           # include if >=35% below baseline
 RARE_MAX_RESULTS = 3
@@ -105,23 +107,21 @@ def parse_iso_dt(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 def is_nonstop_offer(offer):
+    # one-way itinerary must have exactly 1 segment
     for itin in offer["itineraries"]:
         if len(itin["segments"]) != 1:
             return False
     return True
 
-def times_ok(offer):
-    out_seg = offer["itineraries"][0]["segments"][0]
-    ret_seg = offer["itineraries"][1]["segments"][0]
-    out_dep = parse_iso_dt(out_seg["departure"]["at"])
-    ret_dep = parse_iso_dt(ret_seg["departure"]["at"])
-    out_dep_local = NY_TZ.normalize(out_dep.astimezone(NY_TZ)) if out_dep.tzinfo else NY_TZ.localize(out_dep)
-    ret_dep_local = DEN_TZ.normalize(ret_dep.astimezone(DEN_TZ)) if ret_dep.tzinfo else DEN_TZ.localize(ret_dep)
-    if out_dep_local.time() < OUTBOUND_EARLIEST_ET:
-        return False
-    if not (RETURN_WINDOW_START_MT <= ret_dep_local.time() <= RETURN_WINDOW_END_MT):
-        return False
-    return True
+def times_ok_oneway(offer, is_outbound):
+    seg = offer["itineraries"][0]["segments"][0]
+    dep = parse_iso_dt(seg["departure"]["at"])
+    if is_outbound:
+        dep_local = NY_TZ.normalize(dep.astimezone(NY_TZ)) if dep.tzinfo else NY_TZ.localize(dep)
+        return dep_local.time() >= OUTBOUND_EARLIEST_ET
+    else:
+        dep_local = DEN_TZ.normalize(dep.astimezone(DEN_TZ)) if dep.tzinfo else DEN_TZ.localize(dep)
+        return RETURN_WINDOW_START_MT <= dep_local.time() <= RETURN_WINDOW_END_MT
 
 def total_price_for_two(offer):
     return float(offer["price"]["grandTotal"])
@@ -136,23 +136,17 @@ def cabin_from_offer(offer):
     except Exception:
         return "UNKNOWN"
 
-def amadeus_search(token_unused, dep_date, ret_date, include_codes=None, exclude_codes=None):
-    """
-    Call /v2/shopping/flight-offers with:
-    - token auto-refresh
-    - one retry on 401
-    - session-level retries/backoff for transient errors
-    Returns [] on non-fatal RequestException (so the scan keeps going).
-    """
+def amadeus_search_oneway(dep_date, origin, dest, include_codes=None, exclude_codes=None):
+    """GET /v2/shopping/flight-offers with oneWay=true"""
     tok = ensure_token()
     params = {
-        "originLocationCode": ORIGIN,
-        "destinationLocationCode": DEST,
+        "originLocationCode": origin,
+        "destinationLocationCode": dest,
         "departureDate": dep_date,
-        "returnDate": ret_date,
         "adults": ADULTS,
         "currencyCode": CURRENCY,
         "max": 50,
+        "oneWay": "true",
     }
     if NONSTOP_ONLY:
         params["nonStop"] = "true"
@@ -175,7 +169,7 @@ def amadeus_search(token_unused, dep_date, ret_date, include_codes=None, exclude
         r.raise_for_status()
         data = r.json().get("data", [])
     except requests.RequestException as e:
-        print(f"[warn] flight-offers request failed for {dep_date}->{ret_date}: {e}")
+        print(f"[warn] oneway request failed {origin}->{dest} {dep_date}: {e}")
         return []
 
     if exclude_codes:
@@ -185,6 +179,45 @@ def amadeus_search(token_unused, dep_date, ret_date, include_codes=None, exclude
         data = [o for o in data if first_carrier(o) not in excl]
 
     return data
+
+def best_oneway_by_cabin(dep_date, origin, dest, is_outbound):
+    """
+    Return cheapest one-way per cabin (ECONOMY, PREMIUM_ECONOMY, FIRST)
+    that passes nonstop + time windows, preferring PREFERRED/SECONDARY airlines.
+    """
+    winners = {}
+
+    def consider(off):
+        if NONSTOP_ONLY and not is_nonstop_offer(off):
+            return
+        if not times_ok_oneway(off, is_outbound=is_outbound):
+            return
+        cab = cabin_from_offer(off)
+        price = total_price_for_two(off)
+        if cab not in winners or price < winners[cab]["price_total_2"]:
+            seg = off["itineraries"][0]["segments"][0]
+            winners[cab] = {
+                "price_total_2": price,
+                "airline": airline_code(off),
+                "segment": {
+                    "dep": seg["departure"]["at"],
+                    "arr": seg["arrival"]["at"],
+                    "from": seg["departure"]["iataCode"],
+                    "to": seg["arrival"]["iataCode"],
+                },
+            }
+
+    # First pass: preferred + secondary
+    first_pass = list(dict.fromkeys(PREFERRED_AIRLINES + SECONDARY_AIRLINES))
+    for off in amadeus_search_oneway(dep_date, origin, dest, include_codes=first_pass, exclude_codes=BLOCKED_AIRLINES):
+        consider(off)
+
+    # Fallback: any except blocked
+    if not winners:
+        for off in amadeus_search_oneway(dep_date, origin, dest, include_codes=None, exclude_codes=BLOCKED_AIRLINES):
+            consider(off)
+
+    return winners  # may be empty
 
 def generate_thu_sun_pairs(n_weeks, start_from=None):
     today = start_from or date.today()
@@ -204,122 +237,80 @@ def generate_thu_sun_pairs_months(months):
         yield cur_thu, cur_thu + timedelta(days=3)
         cur_thu += timedelta(weeks=1)
 
-def find_offers(token, thu, sun):
-    dep, ret = str(thu), str(sun)
+# ------------ combine OW legs into RT totals ------------
+CABINS = ["ECONOMY", "PREMIUM_ECONOMY", "FIRST"]
 
-    # One pass with preferred + secondary first
-    first_pass = list(dict.fromkeys(PREFERRED_AIRLINES + SECONDARY_AIRLINES))
-    offers = amadeus_search(token, dep, ret,
-                            include_codes=first_pass,
-                            exclude_codes=BLOCKED_AIRLINES)
+def combine_roundtrip_for_weekend(thu, sun):
+    dep_date = str(thu)
+    ret_date = str(sun)
 
-    # Fallback: any airline except blocked
-    if not offers:
-        offers = amadeus_search(token, dep, ret,
-                                include_codes=None,
-                                exclude_codes=BLOCKED_AIRLINES)
+    # For each cabin, find cheapest outbound (NYC->DEN) & return (DEN->NYC) across LGA/JFK
+    winners_rt = {c: None for c in CABINS}
 
-    # Filter by nonstop + time windows
-    filt = []
-    for off in offers:
-        if NONSTOP_ONLY and not is_nonstop_offer(off):
-            continue
-        if not times_ok(off):
-            continue
-        filt.append(off)
-    return filt
+    # Precompute best outbound per cabin per origin
+    best_out_per_origin = {}
+    for o in NYC_OUTBOUND_AIRPORTS:
+        best_out_per_origin[o] = best_oneway_by_cabin(dep_date, o, DEN, is_outbound=True)
 
-def extract_winners_by_cabin(filtered_offers):
-    winners = {}
-    for off in filtered_offers:
-        cab = cabin_from_offer(off)
-        price = total_price_for_two(off)
-        if cab not in winners or price < winners[cab]["price_total_2"]:
-            out_seg = off["itineraries"][0]["segments"][0]
-            ret_seg = off["itineraries"][1]["segments"][0]
-            winners[cab] = {
-                "price_total_2": price,
-                "airline": airline_code(off),
+    # Precompute best return per cabin per return-airport
+    best_ret_per_dest = {}
+    for d in NYC_RETURN_AIRPORTS:
+        best_ret_per_dest[d] = best_oneway_by_cabin(ret_date, DEN, d, is_outbound=False)
+
+    for cabin in CABINS:
+        best_total = None
+        best_combo = None
+
+        for o in NYC_OUTBOUND_AIRPORTS:
+            out_cand = best_out_per_origin[o].get(cabin)
+            if not out_cand:
+                continue
+            for d in NYC_RETURN_AIRPORTS:
+                ret_cand = best_ret_per_dest[d].get(cabin)
+                if not ret_cand:
+                    continue
+                total = out_cand["price_total_2"] + ret_cand["price_total_2"]
+                if best_total is None or total < best_total:
+                    best_total = total
+                    best_combo = (o, d, out_cand, ret_cand)
+
+        if best_combo:
+            o, d, out_cand, ret_cand = best_combo
+            winners_rt[cabin] = {
+                "price_total_2": round(best_total, 2),
+                "airline_out": out_cand["airline"],
+                "airline_ret": ret_cand["airline"],
                 "outbound": {
-                    "dep": out_seg["departure"]["at"],
-                    "arr": out_seg["arrival"]["at"],
-                    "from": out_seg["departure"]["iataCode"],
-                    "to": out_seg["arrival"]["iataCode"],
+                    "dep": out_cand["segment"]["dep"],
+                    "arr": out_cand["segment"]["arr"],
+                    "from": out_cand["segment"]["from"],
+                    "to":   out_cand["segment"]["to"],
                 },
                 "return": {
-                    "dep": ret_seg["departure"]["at"],
-                    "arr": ret_seg["arrival"]["at"],
-                    "from": ret_seg["departure"]["iataCode"],
-                    "to": ret_seg["arrival"]["iataCode"],
+                    "dep": ret_cand["segment"]["dep"],
+                    "arr": ret_cand["segment"]["arr"],
+                    "from": ret_cand["segment"]["from"],
+                    "to":   ret_cand["segment"]["to"],
                 },
             }
-    def p(c): return winners.get(c, {}).get("price_total_2")
+
+    def p(c): return winners_rt.get(c, {}).get("price_total_2")
+    min_price = min([x for x in [p("ECONOMY"), p("PREMIUM_ECONOMY"), p("FIRST")] if x is not None], default=None)
+
     return {
-        "ECONOMY": winners.get("ECONOMY"),
-        "PREMIUM_ECONOMY": winners.get("PREMIUM_ECONOMY"),
-        "FIRST": winners.get("FIRST"),
-        "min_price": min([x for x in [p("ECONOMY"), p("PREMIUM_ECONOMY"), p("FIRST")] if x is not None], default=None),
+        "ECONOMY": winners_rt["ECONOMY"],
+        "PREMIUM_ECONOMY": winners_rt["PREMIUM_ECONOMY"],
+        "FIRST": winners_rt["FIRST"],
+        "min_price": min_price,
     }
 
-def cheapest_by_cabin(token, thu, sun):
-    filtered = find_offers(token, thu, sun)
-    return extract_winners_by_cabin(filtered)
-
-def build_rare_deals(token):
-    """Scan months ahead; build median baseline of ECONOMY prices; emit relative outliers.
-       Resilient: if a weekend query fails, it’s skipped (scan continues)."""
-    records = []  # {"weekend":(thu,sun), "econ_price":float, "winner":dict}
-    for thu, sun in generate_thu_sun_pairs_months(RARE_LOOKAHEAD_MONTHS):
-        try:
-            winners = cheapest_by_cabin(token, thu, sun)
-        except Exception as e:
-            print(f"[warn] weekend {thu}->{sun} failed: {e}")
-            continue
-        econ = winners.get("ECONOMY")
-        if econ and winners["min_price"] is not None:
-            records.append({
-                "weekend": (thu, sun),
-                "econ_price": float(econ["price_total_2"]),
-                "winner": econ
-            })
-
-    if len(records) < 6:
-        return []
-
-    base = median(r["econ_price"] for r in records)
-    if base <= 0:
-        return []
-
-    outliers = []
-    for r in records:
-        drop = (base - r["econ_price"]) / base
-        if drop >= RARE_MIN_DROP:
-            thu, sun = r["weekend"]
-            w = r["winner"]
-            outliers.append({
-                "weekend": {"thu": str(thu), "sun": str(sun)},
-                "cabin": "ECONOMY",
-                "price_total_2": round(r["econ_price"], 2),
-                "pct_below_baseline": round(drop, 4),
-                "airline": w.get("airline"),
-                "outbound": w["outbound"],
-                "return": w["return"],
-            })
-
-    outliers.sort(key=lambda x: (-x["pct_below_baseline"], x["price_total_2"]))
-    return outliers[:RARE_MAX_RESULTS]
-
-# ------------------- main -------------------
-def main():
-    # prime token (also validates secrets early)
-    get_token()
-
-    # Near-term daily pick (~2 months)
+# ------------------- main scans -------------------
+def daily_scan():
     weekends = list(generate_thu_sun_pairs(NEAR_TERM_WEEKS))
     near_results = []
     for thu, sun in weekends:
         try:
-            winners = cheapest_by_cabin(_TOKEN, thu, sun)
+            winners = combine_roundtrip_for_weekend(thu, sun)
         except Exception as e:
             print(f"[warn] near-term weekend {thu}->{sun} failed: {e}")
             winners = {"ECONOMY": None, "PREMIUM_ECONOMY": None, "FIRST": None, "min_price": None}
@@ -327,15 +318,67 @@ def main():
             "weekend": {"thu": str(thu), "sun": str(sun)},
             "winners": winners,
         })
-
     candidates = [r for r in near_results if r["winners"]["min_price"] is not None]
     best = min(candidates, key=lambda r: r["winners"]["min_price"]) if candidates else None
+    return near_results, best
 
-    # Year-ahead rare deals (relative)
-    rare = build_rare_deals(_TOKEN)
+def build_rare_deals():
+    """Median baseline of ECONOMY OW+OW totals; flag big relative drops."""
+    records = []  # {"weekend":(thu,sun), "econ_total":float, "winner":dict}
+    for thu, sun in generate_thu_sun_pairs_months(RARE_LOOKAHEAD_MONTHS):
+        try:
+            winners = combine_roundtrip_for_weekend(thu, sun)
+        except Exception as e:
+            print(f"[warn] rare weekend {thu}->{sun} failed: {e}")
+            continue
+        econ = winners.get("ECONOMY")
+        if econ and winners["min_price"] is not None:
+            records.append({
+                "weekend": (thu, sun),
+                "econ_total": float(econ["price_total_2"]),
+                "winner": econ
+            })
+
+    if len(records) < 6:
+        return []
+
+    base = median(r["econ_total"] for r in records)
+    if base <= 0:
+        return []
+
+    outliers = []
+    for r in records:
+        drop = (base - r["econ_total"]) / base
+        if drop >= RARE_MIN_DROP:
+            thu, sun = r["weekend"]
+            w = r["winner"]
+            outliers.append({
+                "weekend": {"thu": str(thu), "sun": str(sun)},
+                "cabin": "ECONOMY",
+                "price_total_2": round(r["econ_total"], 2),
+                "pct_below_baseline": round(drop, 4),
+                # include per-leg airlines and airports (may differ)
+                "airline_out": w.get("airline_out"),
+                "airline_ret": w.get("airline_ret"),
+                "outbound": w["outbound"],
+                "return":  w["return"],
+            })
+
+    outliers.sort(key=lambda x: (-x["pct_below_baseline"], x["price_total_2"]))
+    return outliers[:RARE_MAX_RESULTS]
+
+def main():
+    # validate/prime token
+    get_token()
+
+    # Near-term daily pick
+    near_results, best = daily_scan()
+
+    # Year-ahead rare deals
+    rare = build_rare_deals()
 
     output = {
-        "route": f"{ORIGIN}-{DEST}",
+        "route": "NYC(LGA/JFK)-DEN mixable",
         "pax": ADULTS,
         "currency": CURRENCY,
         "generated_at_utc": datetime.utcnow().isoformat() + "Z",
