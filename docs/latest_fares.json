@@ -2,20 +2,8 @@
   "route": "NYC(LGA/JFK)-DEN mixable",
   "pax": 2,
   "currency": "USD",
-  "generated_at_utc": "2025-11-27T13:58:25.381285Z",
+  "generated_at_utc": "2025-11-28T13:56:30.805598Z",
   "near_term_scan": [
-    {
-      "weekend": {
-        "thu": "2025-11-27",
-        "sun": "2025-11-30"
-      },
-      "winners": {
-        "ECONOMY": null,
-        "PREMIUM_ECONOMY": null,
-        "FIRST": null,
-        "min_price": null
-      }
-    },
     {
       "weekend": {
         "thu": "2025-12-04",
@@ -104,6 +92,18 @@
       "weekend": {
         "thu": "2026-01-22",
         "sun": "2026-01-25"
+      },
+      "winners": {
+        "ECONOMY": null,
+        "PREMIUM_ECONOMY": null,
+        "FIRST": null,
+        "min_price": null
+      }
+    },
+    {
+      "weekend": {
+        "thu": "2026-01-29",
+        "sun": "2026-02-01"
       },
       "winners": {
         "ECONOMY": null,
